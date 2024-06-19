@@ -24,6 +24,19 @@ class MonodepthOptions:
                                  help="log directory",
                                  default=os.path.join(os.path.expanduser("~"), "tmp"))
 
+        self.parser.add_argument("--model_type",
+                                type=str,
+                                help="model_type",
+                                choices=["manydepth", "croco"],
+                                default="manydepth")
+        self.parser.add_argument("--croco_pretrain_path",
+                                type=str,
+                                help="croco pretrained model path")
+        self.parser.add_argument("--disable_multiloss",
+                                action="store_true")
+        self.parser.add_argument("--multipose_train",
+                                action="store_true")
+
         # TRAINING options
         self.parser.add_argument("--model_name",
                                  type=str,

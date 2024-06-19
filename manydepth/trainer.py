@@ -44,7 +44,6 @@ class Trainer:
 
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
 
-        # checking height and width are multiples of 32
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
         assert self.opt.width % 32 == 0, "'width' must be a multiple of 32"
 
@@ -59,6 +58,7 @@ class Trainer:
 
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
         assert len(self.opt.frame_ids) > 1, "frame_ids must have more than 1 frame specified"
+
 
         self.train_teacher_and_pose = not self.opt.freeze_teacher_and_pose
         if self.train_teacher_and_pose:
@@ -81,31 +81,69 @@ class Trainer:
         print('Loading frames: {}'.format(frames_to_load))
 
         # MODEL SETUP
-        self.models["encoder"] = networks.ResnetEncoderMatching(
-            self.opt.num_layers, self.opt.weights_init == "pretrained",
-            input_height=self.opt.height, input_width=self.opt.width,
-            adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
-            depth_binning=self.opt.depth_binning, num_depth_bins=self.opt.num_depth_bins)
-        self.models["encoder"].to(self.device)
+        if self.opt.model_type=="manydepth":
+            self.models["encoder"] = networks.ResnetEncoderMatching(
+                self.opt.num_layers, self.opt.weights_init == "pretrained",
+                input_height=self.opt.height, input_width=self.opt.width,
+                adaptive_bins=True, min_depth_bin=0.1, max_depth_bin=20.0,
+                depth_binning=self.opt.depth_binning, num_depth_bins=self.opt.num_depth_bins)
+            self.models["encoder"].to(self.device)
 
-        self.models["depth"] = networks.DepthDecoder(
-            self.models["encoder"].num_ch_enc, self.opt.scales)
-        self.models["depth"].to(self.device)
+            self.models["depth"] = networks.DepthDecoder(
+                self.models["encoder"].num_ch_enc, self.opt.scales)
+            self.models["depth"].to(self.device)
 
-        self.parameters_to_train += list(self.models["encoder"].parameters())
-        self.parameters_to_train += list(self.models["depth"].parameters())
+            self.parameters_to_train += list(self.models["encoder"].parameters())
+            self.parameters_to_train += list(self.models["depth"].parameters())
 
-        self.models["mono_encoder"] = \
-            networks.ResnetEncoder(18, self.opt.weights_init == "pretrained")
-        self.models["mono_encoder"].to(self.device)
+            self.models["mono_encoder"] = \
+                networks.ResnetEncoder(18, self.opt.weights_init == "pretrained")
+            self.models["mono_encoder"].to(self.device)
 
-        self.models["mono_depth"] = \
-            networks.DepthDecoder(self.models["mono_encoder"].num_ch_enc, self.opt.scales)
-        self.models["mono_depth"].to(self.device)
+            self.models["mono_depth"] = \
+                networks.DepthDecoder(self.models["mono_encoder"].num_ch_enc, self.opt.scales)
+            self.models["mono_depth"].to(self.device)
 
-        if self.train_teacher_and_pose:
-            self.parameters_to_train += list(self.models["mono_encoder"].parameters())
-            self.parameters_to_train += list(self.models["mono_depth"].parameters())
+            if self.train_teacher_and_pose:
+                self.parameters_to_train += list(self.models["mono_encoder"].parameters())
+                self.parameters_to_train += list(self.models["mono_depth"].parameters())
+
+        elif self.opt.model_type=="croco":
+            from manydepth.networks.croco.croco_downstream import CroCoDownstreamBinocular, croco_args_from_ckpt
+            from manydepth.networks.croco.pos_embed import interpolate_pos_embed
+            from manydepth.networks.croco.head_downstream import PixelwiseTaskWithDPT
+
+            ckpt = torch.load(self.opt.croco_pretrain_path, 'cpu')
+            croco_args = croco_args_from_ckpt(ckpt)
+            croco_args['img_size'] = (192, 640)
+
+            head = PixelwiseTaskWithDPT()
+            head.num_channels = 1
+            # build model and load pretrained weights
+            model = CroCoDownstreamBinocular(head, **croco_args)
+            interpolate_pos_embed(model, ckpt['model'])
+            msg = model.load_state_dict(ckpt['model'], strict=False)
+            print(msg)
+
+            self.models['depth_network'] = model
+            self.models["depth_network"].to(self.device)
+            self.parameters_to_train += list(self.models['depth_network'].parameters())
+
+            if not self.opt.multipose_train:
+                self.models["mono_encoder"] = \
+                    networks.ResnetEncoder(18, self.opt.weights_init == "pretrained")
+                self.models["mono_encoder"].to(self.device)
+
+                self.models["mono_depth"] = \
+                    networks.DepthDecoder(self.models["mono_encoder"].num_ch_enc, self.opt.scales)
+                self.models["mono_depth"].to(self.device)
+
+                if self.train_teacher_and_pose:
+                    self.parameters_to_train += list(self.models["mono_encoder"].parameters())
+                    self.parameters_to_train += list(self.models["mono_depth"].parameters())
+
+
+
 
         self.models["pose_encoder"] = \
             networks.ResnetEncoder(18, self.opt.weights_init == "pretrained",
@@ -336,16 +374,17 @@ class Trainer:
         max_depth_bin = self.max_depth_tracker
 
         # single frame path
-        if self.train_teacher_and_pose:
-            feats = self.models["mono_encoder"](inputs["color_aug", 0, 0])
-            mono_outputs.update(self.models['mono_depth'](feats))
-        else:
-            with torch.no_grad():
+        if not self.opt.multipose_train:
+            if self.train_teacher_and_pose:
                 feats = self.models["mono_encoder"](inputs["color_aug", 0, 0])
                 mono_outputs.update(self.models['mono_depth'](feats))
+            else:
+                with torch.no_grad():
+                    feats = self.models["mono_encoder"](inputs["color_aug", 0, 0])
+                    mono_outputs.update(self.models['mono_depth'](feats))
 
-        self.generate_images_pred(inputs, mono_outputs)
-        mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
+            self.generate_images_pred(inputs, mono_outputs)
+            mono_losses = self.compute_losses(inputs, mono_outputs, is_multi=False)
 
         # update multi frame outputs dictionary with single frame outputs
         for key in list(mono_outputs.keys()):
@@ -356,36 +395,54 @@ class Trainer:
                 outputs[_key] = mono_outputs[key]
 
         # multi frame path
-        features, lowest_cost, confidence_mask = self.models["encoder"](inputs["color_aug", 0, 0],
-                                                                        lookup_frames,
-                                                                        relative_poses,
-                                                                        inputs[('K', 2)],
-                                                                        inputs[('inv_K', 2)],
-                                                                        min_depth_bin=min_depth_bin,
-                                                                        max_depth_bin=max_depth_bin)
-        outputs.update(self.models["depth"](features))
+        if self.opt.model_type=="manydepth":
+            features, lowest_cost, confidence_mask = self.models["encoder"](inputs["color_aug", 0, 0],
+                                                                            lookup_frames,
+                                                                            relative_poses,
+                                                                            inputs[('K', 2)],
+                                                                            inputs[('inv_K', 2)],
+                                                                            min_depth_bin=min_depth_bin,
+                                                                            max_depth_bin=max_depth_bin)
+            outputs.update(self.models["depth"](features))
 
-        outputs["lowest_cost"] = F.interpolate(lowest_cost.unsqueeze(1),
-                                               [self.opt.height, self.opt.width],
-                                               mode="nearest")[:, 0]
-        outputs["consistency_mask"] = F.interpolate(confidence_mask.unsqueeze(1),
-                                                    [self.opt.height, self.opt.width],
-                                                    mode="nearest")[:, 0]
 
-        if not self.opt.disable_motion_masking:
-            outputs["consistency_mask"] = (outputs["consistency_mask"] *
-                                           self.compute_matching_mask(outputs))
+            outputs["lowest_cost"] = F.interpolate(lowest_cost.unsqueeze(1),
+                                                [self.opt.height, self.opt.width],
+                                                mode="nearest")[:, 0]
+            outputs["consistency_mask"] = F.interpolate(confidence_mask.unsqueeze(1),
+                                                        [self.opt.height, self.opt.width],
+                                                        mode="nearest")[:, 0]
 
-        self.generate_images_pred(inputs, outputs, is_multi=True)
-        losses = self.compute_losses(inputs, outputs, is_multi=True)
+            if not self.opt.disable_motion_masking:
+                outputs["consistency_mask"] = (outputs["consistency_mask"] *
+                                            self.compute_matching_mask(outputs))
+
+        elif self.opt.model_type=="croco":
+            output, output_depths = self.models['depth_network'](inputs['color_aug',0,0],lookup_frames.squeeze())
+
+            outputs[('disp',0)] = output_depths[0]
+            outputs[('disp',1)] = output_depths[1]
+            outputs[('disp',2)] = output_depths[2]
+            outputs[('disp',3)] = output_depths[3]
+
+
+
+
+            outputs['lowest_cost'] = None
+            outputs['consistency_mask'] = None
+            ## (disp,3~0이 출력되는 것이 이상적)
+
+
+        self.generate_images_pred(inputs, outputs, is_multi=(not self.opt.multipose_train))
+        losses = self.compute_losses(inputs, outputs, is_multi=(not self.opt.disable_multiloss))
 
         # update losses with single frame losses
-        if self.train_teacher_and_pose:
+        if self.train_teacher_and_pose and (not self.opt.multipose_train):
             for key, val in mono_losses.items():
                 losses[key] += val
 
         # update adaptive depth bins
-        if self.train_teacher_and_pose:
+        if self.train_teacher_and_pose and (not self.opt.multipose_train):
             self.update_adaptive_depth_bins(outputs)
 
         return outputs, losses
@@ -478,10 +535,10 @@ class Trainer:
         """
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
 
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
@@ -637,9 +694,12 @@ class Trainer:
             # consistency loss to
             if is_multi:
                 reprojection_loss_mask = torch.ones_like(reprojection_loss_mask)
-                if not self.opt.disable_motion_masking:
+                if not self.opt.disable_motion_masking and self.opt.model_type=='manydepth':
                     reprojection_loss_mask = (reprojection_loss_mask *
                                               outputs['consistency_mask'].unsqueeze(1))
+                elif not self.opt.disable_motion_masking:
+                    reprojection_loss_mask = self.compute_loss_masks(reprojection_loss,
+                                                             identity_reprojection_loss)
                 if not self.opt.no_matching_augmentation:
                     reprojection_loss_mask = (reprojection_loss_mask *
                                               (1 - outputs['augmentation_mask']))
@@ -752,10 +812,11 @@ class Trainer:
                 "disp_multi_{}/{}".format(s, j),
                 disp, self.step)
 
-            disp = colormap(outputs[('mono_disp', s)][j, 0])
-            writer.add_image(
-                "disp_mono/{}".format(j),
-                disp, self.step)
+            if (not self.opt.multipose_train):
+                disp = colormap(outputs[('mono_disp', s)][j, 0])
+                writer.add_image(
+                    "disp_mono/{}".format(j),
+                    disp, self.step)
 
             if outputs.get("lowest_cost") is not None:
                 lowest_cost = outputs["lowest_cost"][j]
@@ -781,7 +842,7 @@ class Trainer:
                 consistency_target = colormap(outputs["consistency_target/0"][j])
                 writer.add_image(
                     "consistency_target/{}".format(j),
-                    consistency_target, self.step)
+                    consistency_target.squeeze(), self.step)
 
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with

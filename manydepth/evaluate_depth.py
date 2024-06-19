@@ -90,52 +90,113 @@ def evaluate(opt):
 
         # Setup dataloaders
         filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        
+        if opt.model_type=='monodepth':
+            if opt.eval_teacher:
+                encoder_path = os.path.join(opt.load_weights_folder, "mono_encoder.pth")
+                decoder_path = os.path.join(opt.load_weights_folder, "mono_depth.pth")
+                encoder_class = networks.ResnetEncoder
 
-        if opt.eval_teacher:
-            encoder_path = os.path.join(opt.load_weights_folder, "mono_encoder.pth")
-            decoder_path = os.path.join(opt.load_weights_folder, "mono_depth.pth")
-            encoder_class = networks.ResnetEncoder
+            else:
+                encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
+                decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
+                encoder_class = networks.ResnetEncoderMatching
+
+            encoder_dict = torch.load(encoder_path)
+            try:
+                HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
+            except KeyError:
+                print('No "height" or "width" keys found in the encoder state_dict, resorting to '
+                    'using command line values!')
+                HEIGHT, WIDTH = opt.height, opt.width
+
+            if opt.eval_split == 'cityscapes':
+                dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
+                                                        HEIGHT, WIDTH,
+                                                        frames_to_load, 4,
+                                                        is_train=False)
+
+            else:
+                dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
+                                                encoder_dict['height'], encoder_dict['width'],
+                                                frames_to_load, 4,
+                                                is_train=False)
+                                                
+            dataloader = DataLoader(dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
+                                    pin_memory=True, drop_last=False)
+
+            # setup models
+            if opt.eval_teacher:
+                encoder_opts = dict(num_layers=opt.num_layers,
+                                    pretrained=False)
+            else:
+                encoder_opts = dict(num_layers=opt.num_layers,
+                                    pretrained=False,
+                                    input_width=encoder_dict['width'],
+                                    input_height=encoder_dict['height'],
+                                    adaptive_bins=True,
+                                    min_depth_bin=0.1, max_depth_bin=20.0,
+                                    depth_binning=opt.depth_binning,
+                                    num_depth_bins=opt.num_depth_bins)
+                pose_enc_dict = torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"))
+                pose_dec_dict = torch.load(os.path.join(opt.load_weights_folder, "pose.pth"))
+
+                pose_enc = networks.ResnetEncoder(18, False, num_input_images=2)
+                pose_dec = networks.PoseDecoder(pose_enc.num_ch_enc, num_input_features=1,
+                                                num_frames_to_predict_for=2)
+
+                pose_enc.load_state_dict(pose_enc_dict, strict=True)
+                pose_dec.load_state_dict(pose_dec_dict, strict=True)
+
+                min_depth_bin = encoder_dict.get('min_depth_bin')
+                max_depth_bin = encoder_dict.get('max_depth_bin')
+
+                pose_enc.eval()
+                pose_dec.eval()
+
+                if torch.cuda.is_available():
+                    pose_enc.cuda()
+                    pose_dec.cuda()
+
+            encoder = encoder_class(**encoder_opts)
+            depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
+
+            model_dict = encoder.state_dict()
+            encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
+            depth_decoder.load_state_dict(torch.load(decoder_path))
+
+            encoder.eval()
+            depth_decoder.eval()
+
+            if torch.cuda.is_available():
+                encoder.cuda()
+                depth_decoder.cuda()
 
         else:
-            encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
-            decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-            encoder_class = networks.ResnetEncoderMatching
+            from manydepth.networks.croco.croco_downstream import CroCoDownstreamBinocular, croco_args_from_ckpt
+            from manydepth.networks.croco.pos_embed import interpolate_pos_embed
+            from manydepth.networks.croco.head_downstream import PixelwiseTaskWithDPT
 
-        encoder_dict = torch.load(encoder_path)
-        try:
-            HEIGHT, WIDTH = encoder_dict['height'], encoder_dict['width']
-        except KeyError:
-            print('No "height" or "width" keys found in the encoder state_dict, resorting to '
-                  'using command line values!')
-            HEIGHT, WIDTH = opt.height, opt.width
+            ckpt = torch.load(opt.croco_pretrain_path, 'cpu')
+            croco_args = croco_args_from_ckpt(ckpt)
+            croco_args['img_size'] = (192, 640)
+            HEIGHT, WIDTH = 192, 640
 
-        if opt.eval_split == 'cityscapes':
-            dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
-                                                     HEIGHT, WIDTH,
-                                                     frames_to_load, 4,
-                                                     is_train=False)
+            head = PixelwiseTaskWithDPT()
+            head.num_channels = 1
+            # build model and load pretrained weights
+            model = CroCoDownstreamBinocular(head, **croco_args)
+            interpolate_pos_embed(model, ckpt['model'])
+            msg = model.load_state_dict(ckpt['model'], strict=False)
+            print(msg)
 
-        else:
-            dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
-                                               encoder_dict['height'], encoder_dict['width'],
-                                               frames_to_load, 4,
-                                               is_train=False)
-        dataloader = DataLoader(dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
-                                pin_memory=True, drop_last=False)
+            depth_dict = torch.load(os.path.join(opt.load_weights_folder,"depth_network.pth"))
+            model.load_state_dict(depth_dict)
+            if torch.cuda.is_available():
+                model.cuda()
+            model.eval()
 
-        # setup models
-        if opt.eval_teacher:
-            encoder_opts = dict(num_layers=opt.num_layers,
-                                pretrained=False)
-        else:
-            encoder_opts = dict(num_layers=opt.num_layers,
-                                pretrained=False,
-                                input_width=encoder_dict['width'],
-                                input_height=encoder_dict['height'],
-                                adaptive_bins=True,
-                                min_depth_bin=0.1, max_depth_bin=20.0,
-                                depth_binning=opt.depth_binning,
-                                num_depth_bins=opt.num_depth_bins)
+
             pose_enc_dict = torch.load(os.path.join(opt.load_weights_folder, "pose_encoder.pth"))
             pose_dec_dict = torch.load(os.path.join(opt.load_weights_folder, "pose.pth"))
 
@@ -146,31 +207,30 @@ def evaluate(opt):
             pose_enc.load_state_dict(pose_enc_dict, strict=True)
             pose_dec.load_state_dict(pose_dec_dict, strict=True)
 
-            min_depth_bin = encoder_dict.get('min_depth_bin')
-            max_depth_bin = encoder_dict.get('max_depth_bin')
-
-            pose_enc.eval()
-            pose_dec.eval()
-
             if torch.cuda.is_available():
                 pose_enc.cuda()
                 pose_dec.cuda()
 
-        encoder = encoder_class(**encoder_opts)
-        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
+            pose_enc.eval()
+            pose_dec.eval()
 
-        model_dict = encoder.state_dict()
-        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-        depth_decoder.load_state_dict(torch.load(decoder_path))
+            if opt.eval_split == 'cityscapes':
+                dataset = datasets.CityscapesEvalDataset(opt.data_path, filenames,
+                                                        HEIGHT, WIDTH,
+                                                        frames_to_load, 4,
+                                                        is_train=False)
 
-        encoder.eval()
-        depth_decoder.eval()
-
-        if torch.cuda.is_available():
-            encoder.cuda()
-            depth_decoder.cuda()
+            else:
+                dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
+                                                HEIGHT, WIDTH,
+                                                frames_to_load, 4,
+                                                is_train=False)
+                                                
+            dataloader = DataLoader(dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
+                                    pin_memory=True, drop_last=False)
 
         pred_disps = []
+        gt_depths = []
 
         print("-> Computing predictions with size {}x{}".format(HEIGHT, WIDTH))
 
@@ -178,6 +238,7 @@ def evaluate(opt):
         with torch.no_grad():
             for i, data in tqdm.tqdm(enumerate(dataloader)):
                 input_color = data[('color', 0, 0)]
+                gt_depth = data['depth_gt']
                 if torch.cuda.is_available():
                     input_color = input_color.cuda()
 
@@ -241,18 +302,27 @@ def evaluate(opt):
                     if opt.post_process:
                         raise NotImplementedError
 
-                    output, lowest_cost, costvol = encoder(input_color, lookup_frames,
-                                                           relative_poses,
-                                                           K,
-                                                           invK,
-                                                           min_depth_bin, max_depth_bin)
-                    output = depth_decoder(output)
+                    if opt.model_type == 'manydepth':
+
+                        output, lowest_cost, costvol = encoder(input_color, lookup_frames,
+                                                            relative_poses,
+                                                            K,
+                                                            invK,
+                                                            min_depth_bin, max_depth_bin)
+                        output = depth_decoder(output)
+                    else:
+                        output = {}
+                        out_depth, _ = model(input_color, lookup_frames.squeeze(dim=1))
+                        output[('disp',0)] = out_depth
+
 
                 pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
                 pred_disps.append(pred_disp)
+                gt_depths.append(gt_depth)
 
         pred_disps = np.concatenate(pred_disps)
+        gt_depths = np.concatenate(gt_depths)
 
         print('finished predicting!')
 
@@ -300,12 +370,14 @@ def evaluate(opt):
         print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
         quit()
 
-    if opt.eval_split == 'cityscapes':
-        print('loading cityscapes gt depths individually due to their combined size!')
-        gt_depths = os.path.join(splits_dir, opt.eval_split, "gt_depths")
-    else:
-        gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
-        gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
+    # if opt.eval_split == 'cityscapes':
+    #     print('loading cityscapes gt depths individually due to their combined size!')
+    #     gt_depths = os.path.join(splits_dir, opt.eval_split, "gt_depths")
+    # else:
+    #     gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+    #     gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)["data"]
+    gt_depths = gt_depths.squeeze()
+    
 
     print("-> Evaluating")
 
